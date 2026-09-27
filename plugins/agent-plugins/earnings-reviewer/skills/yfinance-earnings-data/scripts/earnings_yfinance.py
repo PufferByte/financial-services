@@ -11,7 +11,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
-import warnings, sys, argparse
+import warnings, sys, os, argparse
 warnings.filterwarnings('ignore')
 
 parser = argparse.ArgumentParser()
@@ -19,7 +19,8 @@ parser.add_argument("--ticker", default="AAPL")
 args, _ = parser.parse_known_args()
 
 TICKER = args.ticker.upper()
-OUT_DIR = "/tmp"
+OUT_DIR = "./out"
+os.makedirs(OUT_DIR, exist_ok=True)
 
 t = yf.Ticker(TICKER)
 COMPANY_NAME = (t.info.get('shortName') or t.info.get('longName') or TICKER)
@@ -35,6 +36,14 @@ bs   = t.quarterly_balance_sheet
 cf   = t.quarterly_cashflow
 info = t.info
 edates = t.earnings_dates
+
+if qf.empty or len(qf.columns) < 5:
+    print(f"[UNSOURCED] '{TICKER}' has no usable quarterly earnings history on "
+          f"Yahoo Finance (found {len(qf.columns)} quarter(s); need >= 5 for a "
+          f"YoY comparison). This is expected for ETFs, indices, delisted, or "
+          f"invalid tickers, and can also happen for a company that IPO'd "
+          f"recently. Not a network error -- the data genuinely isn't there.")
+    sys.exit(1)
 
 # ── 2. IDENTIFY LATEST QUARTER ─────────────────────────────────────────────
 latest_col  = qf.columns[0]   # most recent quarter

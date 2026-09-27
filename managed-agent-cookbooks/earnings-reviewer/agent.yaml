@@ -14,12 +14,9 @@ tools:
       - { name: read,  enabled: true }
       - { name: grep,  enabled: true }
       - { name: glob,  enabled: true }
-  - { type: mcp_toolset, mcp_server_name: factset, default_config: { enabled: true } }
-  - { type: mcp_toolset, mcp_server_name: daloopa, default_config: { enabled: true } }
+      - { name: bash,  enabled: true }   # runs the bundled yfinance-earnings-data scripts
 
-mcp_servers:
-  - { type: url, name: factset, url: "${FACTSET_MCP_URL}" }
-  - { type: url, name: daloopa, url: "${DALOOPA_MCP_URL}" }
+mcp_servers: []   # no paid connector needed -- data comes from yfinance via bash
 
 skills:
   - { from_plugin: ../../plugins/agent-plugins/earnings-reviewer }

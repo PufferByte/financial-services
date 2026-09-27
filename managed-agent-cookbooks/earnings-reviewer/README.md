@@ -4,11 +4,14 @@
 
 Earnings call + filings → model update → note draft. Same source as the [`earnings-reviewer`](../../plugins/agent-plugins/earnings-reviewer) Cowork plugin — this directory is the Managed Agent cookbook for `POST /v1/agents`.
 
+**Data source:** free Yahoo Finance data via the bundled `yfinance-earnings-data` skill (runs via `bash`, no MCP connector, no subscription). Originally built around paid FactSet/Daloopa MCP tools; swapped out to remove that cost. See [`yfinance-earnings-data`](../../plugins/vertical-plugins/equity-research/skills/yfinance-earnings-data/SKILL.md) for the free-data trade-offs (delayed/best-effort data, GAAP-vs-street EPS mismatches) and its bundled historical beat/miss backtest (`predict.py`).
+
 ## Deploy
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-export FACTSET_MCP_URL=... DALOOPA_MCP_URL=...
+# no FACTSET_MCP_URL / DALOOPA_MCP_URL needed -- only outbound internet access
+# for Yahoo Finance (yfinance)
 ../../scripts/deploy-managed-agent.sh earnings-reviewer
 ```
 
@@ -23,7 +26,7 @@ Transcripts and press releases are untrusted. Three-tier isolation:
 | Tier | Touches untrusted docs? | Tools | Connectors |
 |---|---|---|---|
 | **`transcript-reader`** | **Yes** | `Read`, `Grep` only | None |
-| `model-updater` / Orchestrator | No | `Read`, `Grep`, `Glob`, `Agent` | FactSet, Daloopa (read-only) |
+| `model-updater` / Orchestrator | No | `Read`, `Grep`, `Glob`, `Bash`, `Agent` | None (free `yfinance` data via bash, no MCP) |
 | **`note-writer`** (Write-holder) | No | `Read`, `Write`, `Edit` | None |
 
 `transcript-reader` returns length-capped, schema-validated JSON. `note-writer` produces `./out/note-<ticker>.docx` and the updated model at `./out/model-<ticker>.xlsx`.
