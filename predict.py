@@ -23,10 +23,15 @@ Method:
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import warnings
+import warnings, argparse
 warnings.filterwarnings("ignore")
 
-TICKERS = ["AAPL", "MSFT", "NVDA"]
+parser = argparse.ArgumentParser()
+parser.add_argument("--tickers", default="AAPL,MSFT,NVDA",
+                     help="Comma-separated tickers to backtest, e.g. --tickers TSLA,GOOGL")
+args, _ = parser.parse_known_args()
+
+TICKERS = [tk.strip().upper() for tk in args.tickers.split(",") if tk.strip()]
 HORIZONS = [("1wk", 5), ("1mo", 21), ("3mo", 63)]  # trading days
 
 def get_reaction_and_forward(ticker):
