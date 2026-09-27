@@ -23,7 +23,7 @@ Each agent plugin is **self-contained** — it bundles the skills it uses, so in
 | **Coverage & advisory** | **[Pitch Agent](./plugins/agent-plugins/pitch-agent)** | Comps, precedents, LBO → branded pitch deck, end to end |
 | | **[Meeting Prep Agent](./plugins/agent-plugins/meeting-prep-agent)** | Briefing pack before every client meeting |
 | **Research & modeling** | **[Market Researcher](./plugins/agent-plugins/market-researcher)** | Sector or theme → industry overview, competitive landscape, peer comps, ideas shortlist |
-| | **[Earnings Reviewer](./plugins/agent-plugins/earnings-reviewer)** | Earnings call + filings → model update → note draft |
+| | **[Earnings Reviewer](./plugins/agent-plugins/earnings-reviewer)** | Earnings call + filings → model update → note draft. Runs on free Yahoo Finance data (`yfinance-earnings-data` skill) — no FactSet/Daloopa subscription required — and includes a historical beat/miss backtest for signal context. |
 | | **[Model Builder](./plugins/agent-plugins/model-builder)** | DCF, LBO, 3-statement, comps — live in Excel |
 | **Fund admin & finance ops** | **[Valuation Reviewer](./plugins/agent-plugins/valuation-reviewer)** | Ingests GP packages, runs valuation template, stages LP reporting |
 | | **[GL Reconciler](./plugins/agent-plugins/gl-reconciler)** | Finds breaks, traces root cause, routes for sign-off |
@@ -134,6 +134,8 @@ All connectors are centralized in the **financial-analysis** core plugin and sha
 | [Box](https://www.box.com/home) | `https://mcp.box.com` |
 
 > MCP access may require a subscription or API key from the provider.
+
+**Exception:** [Earnings Reviewer](./plugins/agent-plugins/earnings-reviewer) does not use these connectors. It runs on free Yahoo Finance data via the bundled `yfinance-earnings-data` skill instead of `mcp__factset__*` / `mcp__daloopa__*` — see that plugin's agent prompt and [managed-agent-cookbooks/earnings-reviewer/README.md](./managed-agent-cookbooks/earnings-reviewer/README.md) for the trade-offs (delayed/best-effort data, GAAP-vs-street EPS mismatches).
 
 ## Claude for Microsoft 365 — Install Tooling
 
