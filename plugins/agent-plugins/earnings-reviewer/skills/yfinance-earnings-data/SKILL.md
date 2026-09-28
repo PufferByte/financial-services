@@ -35,6 +35,16 @@ Historical backtest of the **earnings reaction**. For every past reported quarte
 
 `--out records.jsonl` also writes one JSON line per quarter -- `features` (EPS estimate/reported/surprise, revenue YoY, gross margin, plus null transcript-sentiment placeholders) and `labels` (raw and excess-vs-SPY returns as fractions; null until the horizon has elapsed), with `available_at` / `t0` recording when the inputs were public and where returns start. Revenue YoY and gross margin are only filled for the ~5 most recent quarters Yahoo's `quarterly_financials` covers.
 
+`--raw-dir DIR` saves the raw Yahoo responses (earnings dates, quarterly financials, prices) as timestamped CSVs, and every JSONL record carries `retrieved_at` -- Yahoo revises history silently, so a result is only reproducible from its snapshot. Hit rates are printed with a 95% Wilson interval and an exact binomial p-value against the base rate.
+
+Out-of-sample check on those records (time-based split, never random):
+
+```bash
+python scripts/evaluate.py records.jsonl --split-date 2019-01-01 --label excess_return_1d --features eps_surprise
+```
+
+Compares an always-majority baseline, the BEAT/MISS rule, and a logistic regression on `--features` by accuracy, balanced accuracy, MCC, and the average return of trading the call. Transcript features are just more `--features` once they are filled in.
+
 `--anchor post-call` switches to the **post-call return**: t0 is the first regular-session open/close at least `--call-lag` hours (default 3) after the print, i.e. once the call transcript exists (after-market print: next day's open). Use this whenever the question is "does what was said on the call predict the move from here" -- the default pre-print anchor includes the price move that happened before the transcript was available.
 
 Signal is BEAT / INLINE / MISS from Yahoo's Surprise% (`--inline-band`, default 0). For each horizon it reports the hit rate **next to the base rate** (share of all quarters that moved that way) and the difference ("edge"). Quarters whose Yahoo timestamp has no time of day can't be placed before/after the open, so they are excluded unless `--assume-unknown bmo|amc` is given.

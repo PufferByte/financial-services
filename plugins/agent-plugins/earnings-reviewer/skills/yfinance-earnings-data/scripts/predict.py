@@ -42,7 +42,7 @@ nothing if the stock rose after 75% of all prints anyway.
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import warnings, argparse, sys, json
+import warnings, argparse, sys, json, math, os
 warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser()
@@ -63,8 +63,12 @@ parser.add_argument("--assume-unknown", choices=["skip", "bmo", "amc"], default=
                     help="How to treat earnings timestamps with no time of day (00:00)")
 parser.add_argument("--out", default="",
                     help="Also write one JSON record per quarter (features + labels) to this .jsonl path")
+parser.add_argument("--raw-dir", default="",
+                    help="Save the raw Yahoo responses (earnings dates, financials, prices) as CSVs here")
 args, _ = parser.parse_known_args()
 
+RETRIEVED_AT = pd.Timestamp.now(tz="UTC").floor("s")
+RUN_STAMP = RETRIEVED_AT.strftime("%Y%m%dT%H%M%SZ")
 TICKERS = [tk.strip().upper() for tk in args.tickers.split(",") if tk.strip()]
 BENCH = args.benchmark.strip().upper()
 HORIZONS = [("1d", 1), ("1wk", 5), ("1mo", 21), ("3mo", 63)]  # trading days after t0
@@ -95,6 +99,7 @@ def load_timeline(ticker, start):
     hist = yf.Ticker(ticker).history(start=start, end=None, auto_adjust=True)
     if hist is None or hist.empty or "Close" not in hist:
         return None
+    save_raw(ticker, "prices", hist)
     hist = hist[["Open", "Close"]].dropna()
     days = to_ny_naive(hist.index).normalize()
     times = np.empty(2 * len(days), dtype="datetime64[ns]")
@@ -157,6 +162,14 @@ def financial_features(qf, edate):
     return out
 
 
+def save_raw(ticker, name, df):
+    """Keep the exact Yahoo response on disk: Yahoo revises history silently, so a
+    result is only reproducible from the snapshot it was computed on."""
+    if args.raw_dir and df is not None and not df.empty:
+        os.makedirs(args.raw_dir, exist_ok=True)
+        df.to_csv(os.path.join(args.raw_dir, f"{ticker}_{name}_{RUN_STAMP}.csv"))
+
+
 def get_returns(ticker, bench_tl):
     t = yf.Ticker(ticker)
     try:
@@ -165,6 +178,8 @@ def get_returns(ticker, bench_tl):
     except Exception:
         qf = None
     ed = t.get_earnings_dates(limit=args.limit)
+    save_raw(ticker, "quarterly_financials", qf)
+    save_raw(ticker, "earnings_dates", ed)
     if ed is None or ed.empty:
         raise ValueError("no earnings dates returned")
     ed = ed.dropna(subset=["Reported EPS", "Surprise(%)"]).copy()
@@ -248,6 +263,11 @@ def _num(v, scale=1.0):
     return None if v is None or pd.isna(v) else float(v) * scale
 
 
+def _str(v):
+    """NaN/None -> None; pandas turns a None in a mostly-string column into NaN."""
+    return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
+
+
 def write_records(df, path):
     """One JSON line per quarter: features (model inputs) + labels (realized returns).
 
@@ -259,12 +279,14 @@ def write_records(df, path):
         for r in df.itertuples(index=False):
             rec = {
                 "ticker": r.ticker,
+                "retrieved_at": RETRIEVED_AT.isoformat(),
+                "data_source": "yfinance " + yf.__version__,
                 "earnings_ts": r.earnings_ts.isoformat(),
                 "timing": r.timing,
-                "fiscal_quarter_end": r.fiscal_quarter_end,
+                "fiscal_quarter_end": _str(r.fiscal_quarter_end),
                 "anchor": args.anchor,
-                "available_at": r.available_at.isoformat() if r.available_at is not None else None,
-                "t0": r.t0,
+                "available_at": r.available_at.isoformat() if _str(r.available_at) is not None and pd.notna(r.available_at) else None,
+                "t0": _str(r.t0),
                 "p0": _num(r.p0),
                 "features": {
                     "eps_estimate": _num(r.eps_est),
@@ -282,7 +304,7 @@ def write_records(df, path):
                     **{f"excess_return_{lbl}": _num(getattr(r, f"xret_{lbl}"), 0.01) for lbl, _ in HORIZONS},
                 },
             }
-            fh.write(json.dumps(rec) + "\n")
+            fh.write(json.dumps(rec, allow_nan=False) + "\n")
     print(f"[OUT] wrote {len(df)} record(s) -> {path}")
 
 
@@ -312,8 +334,34 @@ if n_unknown and args.assume_unknown == "skip":
           f"(use --assume-unknown bmo|amc to include).")
 
 
+def binom_p_two_sided(k, n, p):
+    """Exact two-sided binomial test: P(outcome at least as unlikely as k | n, p)."""
+    if n == 0 or p <= 0 or p >= 1:
+        return float("nan")
+    pmf = [math.comb(n, i) * p**i * (1 - p)**(n - i) for i in range(n + 1)]
+    return min(1.0, sum(q for q in pmf if q <= pmf[k] * (1 + 1e-9)))
+
+
+def wilson_ci(k, n, z=1.96):
+    """95% Wilson score interval for a proportion, in percent."""
+    if n == 0:
+        return float("nan"), float("nan")
+    ph = k / n
+    den = 1 + z**2 / n
+    mid = (ph + z**2 / (2 * n)) / den
+    half = z * math.sqrt(ph * (1 - ph) / n + z**2 / (4 * n**2)) / den
+    return (mid - half) * 100, (mid + half) * 100
+
+
 def signal_stats(sub, col):
-    """Print per-signal avg / hit rate vs. base rate for one return column."""
+    """Print per-signal avg / hit rate vs. base rate for one return column.
+
+    Significance: exact binomial test of the signal's hit count against the base
+    rate (H0: the signal's hit rate equals the unconditional rate), plus a 95%
+    Wilson interval on the hit rate. The base rate is estimated from the same
+    sample, so treat p-values as approximate; with many horizons x tickers,
+    expect ~5% of p-values < 0.05 by chance alone.
+    """
     base_up = (sub[col] > 0).mean() * 100
     base_down = (sub[col] < 0).mean() * 100   # zero returns count as neither
     for sig in ["BEAT", "INLINE", "MISS"]:
@@ -322,15 +370,18 @@ def signal_stats(sub, col):
             continue
         avg = g[col].mean()
         if sig == "BEAT":
-            hit, base = (g[col] > 0).mean() * 100, base_up
+            k, base = int((g[col] > 0).sum()), base_up
         elif sig == "MISS":
-            hit, base = (g[col] < 0).mean() * 100, base_down
+            k, base = int((g[col] < 0).sum()), base_down
         else:
             print(f"  {sig:<6} n={len(g):<3} avg {avg:+6.2f}%   (no directional call)")
             continue
+        hit = k / len(g) * 100
+        lo, hi = wilson_ci(k, len(g))
+        pval = binom_p_two_sided(k, len(g), base / 100)
         small = "  [n<10: not meaningful]" if len(g) < 10 else ""
-        print(f"  {sig:<6} n={len(g):<3} avg {avg:+6.2f}%   hit {hit:5.1f}%  "
-              f"vs base rate {base:5.1f}%  -> edge {hit - base:+5.1f}pp{small}")
+        print(f"  {sig:<6} n={len(g):<3} avg {avg:+6.2f}%   hit {hit:5.1f}% [95% CI {lo:4.1f}-{hi:5.1f}]  "
+              f"vs base {base:5.1f}%  -> edge {hit - base:+5.1f}pp  p={pval:.3f}{small}")
     print(f"  ALL    n={len(sub):<3} avg {sub[col].mean():+6.2f}%   "
           f"share positive {base_up:5.1f}%  (unconditional, for reference)")
 
