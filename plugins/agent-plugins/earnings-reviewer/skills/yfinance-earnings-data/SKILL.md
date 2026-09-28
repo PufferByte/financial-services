@@ -33,6 +33,8 @@ Historical backtest of the **earnings reaction**. For every past reported quarte
 - `1wk` / `1mo` / `3mo` = 5 / 21 / 63 trading days after the pre-print close (these include the day-1 reaction)
 - each also reported **in excess of SPY** (`--benchmark`) over the same window
 
+`--anchor post-call` switches to the **post-call return**: t0 is the first regular-session open/close at least `--call-lag` hours (default 3) after the print, i.e. once the call transcript exists (after-market print: next day's open). Use this whenever the question is "does what was said on the call predict the move from here" -- the default pre-print anchor includes the price move that happened before the transcript was available.
+
 Signal is BEAT / INLINE / MISS from Yahoo's Surprise% (`--inline-band`, default 0). For each horizon it reports the hit rate **next to the base rate** (share of all quarters that moved that way) and the difference ("edge"). Quarters whose Yahoo timestamp has no time of day can't be placed before/after the open, so they are excluded unless `--assume-unknown bmo|amc` is given.
 
 Fold this into the note as context, e.g. "historically, a beat at this name has been followed by a positive 1-day reaction in N of M quarters (X%, vs. a Y% base rate)" -- always quote the base rate alongside the hit rate; a high hit rate on a stock that rises after most prints anyway carries no information.

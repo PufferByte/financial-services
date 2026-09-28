@@ -2,19 +2,28 @@
 Earnings Reviewer — historical backtest add-on (free data, yfinance only)
 
 Question: does the tool's post-earnings signal (EPS beat / inline / miss)
-line up with the stock's *earnings reaction* and the moves that follow?
+line up with the stock's move after the print?
 
-Return definition (the prediction target):
-- pre_close  = the last regular-session close BEFORE the announcement became
-  public. After-market (>= 16:00 ET) print -> that day's close; pre-market /
-  intraday print -> the previous trading day's close.
-- post_close = the first regular-session close AFTER the announcement, i.e.
-  the next trading day after pre_close.
-- ret_1d  = post_close / pre_close - 1            (the earnings reaction itself)
-- ret_1wk / ret_1mo / ret_3mo = close 5 / 21 / 63 trading days after
-  pre_close, over pre_close. These INCLUDE the day-1 reaction.
-- Every return is also reported in excess of the benchmark (default SPY)
-  over the same window.
+Two anchors (the price t0 every return is measured from), picked with --anchor:
+
+- pre  (default) -- Task A, the full EARNINGS REACTION. t0 = the last
+  regular-session close BEFORE the announcement became public. After-market
+  (>= 16:00 ET) print -> that day's close; pre-market / intraday print -> the
+  previous trading day's close. ret_1d = next close / t0 - 1.
+
+- post-call -- Task B, POST-CALL RETURN. t0 = the first regular-session price
+  (09:30 open or 16:00 close) at or after the transcript is available, taken
+  as announcement time + --call-lag hours (default 3: release, then a ~1h
+  call, then some slack). After-market print -> next day's open (the
+  after-hours / gap move is excluded); pre-market print -> that day's open,
+  or its close if the call runs into the session. Use this anchor whenever
+  the model's inputs include the call transcript: the pre anchor would credit
+  the model with price moves that happened before the transcript existed.
+
+Horizons 1d / 1wk / 1mo / 3mo = 1 / 5 / 21 / 63 trading days: the return runs
+from t0 to that many sessions' closes later (an open anchor's 1d is that same
+day's close). Every return is also reported in excess of the benchmark
+(default SPY) over exactly the same window.
 
 Timing: Yahoo's earnings timestamps carry a time of day (ET). A timestamp at
 exactly 00:00 has no usable time, so we can't tell pre- from after-market;
@@ -39,6 +48,11 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser()
 parser.add_argument("--tickers", default="AAPL,MSFT,NVDA",
                      help="Comma-separated tickers to backtest, e.g. --tickers TSLA,GOOGL")
+parser.add_argument("--anchor", choices=["pre", "post-call"], default="pre",
+                    help="pre = full earnings reaction from the pre-print close (Task A); "
+                         "post-call = return from the first price after the call (Task B)")
+parser.add_argument("--call-lag", type=float, default=3.0,
+                    help="Hours from announcement until the transcript is available (post-call only)")
 parser.add_argument("--benchmark", default="SPY",
                     help="Benchmark for excess returns (default SPY); pass '' to disable")
 parser.add_argument("--limit", type=int, default=100,
@@ -51,7 +65,8 @@ args, _ = parser.parse_known_args()
 
 TICKERS = [tk.strip().upper() for tk in args.tickers.split(",") if tk.strip()]
 BENCH = args.benchmark.strip().upper()
-HORIZONS = [("1d", 1), ("1wk", 5), ("1mo", 21), ("3mo", 63)]  # trading days after pre_close
+HORIZONS = [("1d", 1), ("1wk", 5), ("1mo", 21), ("3mo", 63)]  # trading days after t0
+MARKET_OPEN = pd.Timedelta(hours=9, minutes=30)
 MARKET_CLOSE = pd.Timedelta(hours=16)
 
 
@@ -70,16 +85,43 @@ def classify(surprise):
     return "INLINE"
 
 
-def load_closes(ticker, start):
+def load_timeline(ticker, start):
+    """Regular-session prices as one time-ordered Series: open, close, open, close, ...
+
+    Event i belongs to trading day i // 2 and is that day's open (i even) or close (i odd).
+    """
     hist = yf.Ticker(ticker).history(start=start, end=None, auto_adjust=True)
     if hist is None or hist.empty or "Close" not in hist:
         return None
-    closes = hist["Close"].dropna()
-    closes.index = to_ny_naive(closes.index).normalize()
-    return closes
+    hist = hist[["Open", "Close"]].dropna()
+    days = to_ny_naive(hist.index).normalize()
+    times = np.empty(2 * len(days), dtype="datetime64[ns]")
+    times[0::2] = (days + MARKET_OPEN).values
+    times[1::2] = (days + MARKET_CLOSE).values
+    prices = np.empty(2 * len(days))
+    prices[0::2] = hist["Open"].values
+    prices[1::2] = hist["Close"].values
+    return pd.Series(prices, index=pd.DatetimeIndex(times))
 
 
-def get_reaction_and_forward(ticker, bench_closes):
+def anchor_index(tl, ann):
+    """Timeline index of t0 for an announcement at `ann`, or None if not in the data."""
+    if args.anchor == "pre":
+        closes = tl.index[1::2]
+        pos = closes.searchsorted(ann, side="right") - 1   # last close at/before the print
+        return 2 * pos + 1 if pos >= 0 else None
+    i = tl.index.searchsorted(ann + pd.Timedelta(hours=args.call_lag), side="left")
+    return i if i < len(tl) else None
+
+
+def horizon_index(i0, ndays):
+    """Close `ndays` sessions after t0 (an open's first session is its own day)."""
+    day0 = i0 // 2
+    end_day = day0 + ndays - (1 if i0 % 2 == 0 else 0)
+    return 2 * end_day + 1
+
+
+def get_returns(ticker, bench_tl):
     t = yf.Ticker(ticker)
     ed = t.get_earnings_dates(limit=args.limit)
     if ed is None or ed.empty:
@@ -90,26 +132,18 @@ def get_reaction_and_forward(ticker, bench_closes):
     ed.index = to_ny_naive(ed.index)
     ed = ed[~ed.index.duplicated()].sort_index()
 
-    closes = load_closes(ticker, (ed.index.min() - pd.Timedelta(days=10)).date().isoformat())
-    if closes is None:
+    tl = load_timeline(ticker, (ed.index.min() - pd.Timedelta(days=10)).date().isoformat())
+    if tl is None:
         raise ValueError("no price history returned")
-    trading_days = closes.index
-    close_times = trading_days + MARKET_CLOSE
 
     rows = []
     for edate, r in ed.iterrows():
-        has_time = edate != edate.normalize()
-        if has_time:
+        if edate != edate.normalize():
             timing = "AMC" if edate >= edate.normalize() + MARKET_CLOSE else "BMO/DMH"
             ann = edate
         else:
             timing = "UNKNOWN"
-            if args.assume_unknown == "amc":
-                ann = edate + MARKET_CLOSE
-            elif args.assume_unknown == "bmo":
-                ann = edate
-            else:
-                ann = None
+            ann = {"amc": edate + MARKET_CLOSE, "bmo": edate}.get(args.assume_unknown)
 
         row = {
             "ticker": ticker,
@@ -119,45 +153,42 @@ def get_reaction_and_forward(ticker, bench_closes):
             "eps_rep": r["Reported EPS"],
             "surprise_pct": r["Surprise(%)"],
             "signal": classify(r["Surprise(%)"]),
-            "pre_date": None, "post_date": None, "pre_close": np.nan,
+            "t0": None, "p0": np.nan,
         }
         for label, _ in HORIZONS:
             row[f"ret_{label}"] = np.nan
             row[f"xret_{label}"] = np.nan
 
-        if ann is not None:
-            # last session whose 16:00 close is at or before the announcement
-            pre_pos = close_times.searchsorted(ann, side="right") - 1
-            if 0 <= pre_pos < len(trading_days) - 1:
-                pre_close = closes.iloc[pre_pos]
-                row["pre_date"] = trading_days[pre_pos].date()
-                row["post_date"] = trading_days[pre_pos + 1].date()
-                row["pre_close"] = pre_close
-                for label, ndays in HORIZONS:
-                    fpos = pre_pos + ndays
-                    if fpos >= len(trading_days):
-                        continue  # horizon hasn't happened yet
-                    ret = (closes.iloc[fpos] / pre_close - 1) * 100
-                    row[f"ret_{label}"] = ret
-                    if bench_closes is not None:
-                        d0, d1 = trading_days[pre_pos], trading_days[fpos]
-                        if d0 in bench_closes.index and d1 in bench_closes.index:
-                            bret = (bench_closes[d1] / bench_closes[d0] - 1) * 100
-                            row[f"xret_{label}"] = ret - bret
+        i0 = anchor_index(tl, ann) if ann is not None else None
+        if i0 is not None:
+            p0 = tl.iloc[i0]
+            row["t0"] = tl.index[i0].strftime("%Y-%m-%d ") + ("open" if i0 % 2 == 0 else "close")
+            row["p0"] = p0
+            for label, ndays in HORIZONS:
+                i1 = horizon_index(i0, ndays)
+                if i1 >= len(tl):
+                    continue  # horizon hasn't happened yet
+                ret = (tl.iloc[i1] / p0 - 1) * 100
+                row[f"ret_{label}"] = ret
+                if bench_tl is not None:
+                    t_0, t_1 = tl.index[i0], tl.index[i1]
+                    if t_0 in bench_tl.index and t_1 in bench_tl.index:
+                        bret = (bench_tl[t_1] / bench_tl[t_0] - 1) * 100
+                        row[f"xret_{label}"] = ret - bret
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-bench_closes = None
+bench_tl = None
 if BENCH:
-    bench_closes = load_closes(BENCH, "1995-01-01")
-    if bench_closes is None:
+    bench_tl = load_timeline(BENCH, "1995-01-01")
+    if bench_tl is None:
         print(f"[WARN] could not load benchmark {BENCH}; excess returns disabled")
 
 all_rows = []
 for tk in TICKERS:
     try:
-        all_rows.append(get_reaction_and_forward(tk, bench_closes))
+        all_rows.append(get_returns(tk, bench_tl))
     except Exception as e:
         print(f"[SKIP] {tk}: {e}")
 if not all_rows:
@@ -169,15 +200,18 @@ usable = big[big["timing"] != "UNKNOWN"] if args.assume_unknown == "skip" else b
 pd.set_option("display.width", 200)
 pd.set_option("display.max_rows", 500)
 
+anchor_desc = ("last close BEFORE the print (full earnings reaction)" if args.anchor == "pre"
+               else f"first price >= {args.call_lag:g}h after the print (post-call)")
 print("=" * 110)
-print("  PER-QUARTER DETAIL   (returns measured from the last close BEFORE the print)")
+print(f"  PER-QUARTER DETAIL   (t0 = {anchor_desc})")
 print("=" * 110)
-show_cols = ["ticker", "earnings_ts", "timing", "signal", "surprise_pct", "pre_date",
-             "pre_close", "ret_1d", "xret_1d", "ret_1wk", "ret_1mo", "ret_3mo"]
+show_cols = ["ticker", "earnings_ts", "timing", "signal", "surprise_pct", "t0",
+             "p0", "ret_1d", "xret_1d", "ret_1wk", "ret_1mo", "ret_3mo"]
 detail = big[show_cols].copy()
 for c in ["surprise_pct", "ret_1d", "xret_1d", "ret_1wk", "ret_1mo", "ret_3mo"]:
     detail[c] = detail[c].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "-")
-detail["pre_close"] = detail["pre_close"].map(lambda v: f"${v:.2f}" if pd.notna(v) else "-")
+detail["p0"] = detail["p0"].map(lambda v: f"${v:.2f}" if pd.notna(v) else "-")
+detail["t0"] = detail["t0"].fillna("-")
 detail["earnings_ts"] = detail["earnings_ts"].map(lambda v: v.strftime("%Y-%m-%d %H:%M"))
 print(detail.to_string(index=False))
 n_unknown = (big["timing"] == "UNKNOWN").sum()
@@ -189,6 +223,7 @@ if n_unknown and args.assume_unknown == "skip":
 def signal_stats(sub, col):
     """Print per-signal avg / hit rate vs. base rate for one return column."""
     base_up = (sub[col] > 0).mean() * 100
+    base_down = (sub[col] < 0).mean() * 100   # zero returns count as neither
     for sig in ["BEAT", "INLINE", "MISS"]:
         g = sub[sub["signal"] == sig]
         if g.empty:
@@ -197,7 +232,7 @@ def signal_stats(sub, col):
         if sig == "BEAT":
             hit, base = (g[col] > 0).mean() * 100, base_up
         elif sig == "MISS":
-            hit, base = (g[col] < 0).mean() * 100, 100 - base_up
+            hit, base = (g[col] < 0).mean() * 100, base_down
         else:
             print(f"  {sig:<6} n={len(g):<3} avg {avg:+6.2f}%   (no directional call)")
             continue

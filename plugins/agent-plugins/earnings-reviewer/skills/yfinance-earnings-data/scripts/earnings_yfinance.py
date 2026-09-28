@@ -119,7 +119,9 @@ if not reported_dates.empty:
         street_eps    = row_ed['Reported EPS'] if pd.notna(row_ed['Reported EPS']) else None
         surprise_pct  = row_ed['Surprise(%)'] if pd.notna(row_ed['Surprise(%)']) else None
 
-# Analyst consensus price target
+# Analyst consensus price target -- a LIVE snapshot as of today, not as of the print date.
+# Fine for a current-quarter note; never feed these fields into a historical backtest
+# (that would be look-ahead: today's targets already reflect the post-earnings move).
 price     = info.get('currentPrice')
 pt_mean   = info.get('targetMeanPrice')
 pt_high   = info.get('targetHighPrice')
