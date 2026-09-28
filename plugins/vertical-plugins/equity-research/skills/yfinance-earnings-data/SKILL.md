@@ -27,14 +27,22 @@ Use this in place of workflow step 1 ("Pull the print. FactSet/Daloopa MCP for r
 python scripts/predict.py --tickers <TICKER>
 ```
 
-Historical backtest: for every past reported quarter (as far back as Yahoo has earnings-date history, often 5+ years), it anchors the post-earnings "reaction price" the first trading day after the print, then measures the real forward return at +1 week / +1 month / +3 months, and reports whether a BEAT was actually followed by a positive move (and a MISS by a negative one) -- i.e. an empirical hit rate per horizon, not just today's single data point.
+Historical backtest of the **earnings reaction**. For every past reported quarter (up to `--limit`, default 100 earnings dates), returns are measured from the **last close before the print became public** (after-market print: that day's close; pre-market print: the prior day's close):
 
-Fold this into the note as context, e.g. "historically, a beat at this name has preceded a positive 1-month move in N of M quarters (X%)" -- it tells the reader how much weight to put on today's beat/miss, which the single-quarter pull from Step 1 cannot.
+- `1d` = next close vs. that pre-print close -- the earnings reaction itself
+- `1wk` / `1mo` / `3mo` = 5 / 21 / 63 trading days after the pre-print close (these include the day-1 reaction)
+- each also reported **in excess of SPY** (`--benchmark`) over the same window
+
+Signal is BEAT / INLINE / MISS from Yahoo's Surprise% (`--inline-band`, default 0). For each horizon it reports the hit rate **next to the base rate** (share of all quarters that moved that way) and the difference ("edge"). Quarters whose Yahoo timestamp has no time of day can't be placed before/after the open, so they are excluded unless `--assume-unknown bmo|amc` is given.
+
+Fold this into the note as context, e.g. "historically, a beat at this name has been followed by a positive 1-day reaction in N of M quarters (X%, vs. a Y% base rate)" -- always quote the base rate alongside the hit rate; a high hit rate on a stock that rises after most prints anyway carries no information.
 
 **Caveats to carry into the note, not just this skill:**
 - Small-sample risk: a name that rarely misses will have very few MISS data points; don't quote a MISS-conditional average return as if it were statistically meaningful with n < ~10.
 - This is EPS-surprise-direction only, not the full multi-factor signal (revenue growth, margin trend, FCF, PT upside) from Step 1 -- Yahoo's free `quarterly_financials` only gives ~5 quarters of history, not enough to reconstruct the full rule further back.
 - No transaction costs, slippage, or statistical significance testing. Report it as descriptive history, not a trading recommendation.
+- The default ticker list (AAPL, MSFT, NVDA) is three long-run winners -- raw returns are biased upward; prefer the excess-vs-SPY rows.
+- Step 1's revenue beat/miss is `[UNSOURCED]`: Yahoo has no historical revenue consensus for an already-reported quarter. EPS beat/miss is computed on the street basis (Yahoo "Reported EPS" vs. "EPS Estimate"), not GAAP diluted EPS.
 
 ## Both scripts accept comma-separated / repeated use across a coverage list
 

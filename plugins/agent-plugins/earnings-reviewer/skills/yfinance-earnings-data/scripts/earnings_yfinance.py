@@ -48,7 +48,10 @@ if qf.empty or len(qf.columns) < 5:
 # ── 2. IDENTIFY LATEST QUARTER ─────────────────────────────────────────────
 latest_col  = qf.columns[0]   # most recent quarter
 prev_q_col  = qf.columns[1]   # previous quarter
-prev_yr_col = qf.columns[4]   # same quarter last year (4 quarters back)
+# same quarter last year: match by date, not position -- Yahoo sometimes drops a quarter,
+# in which case columns[4] would silently be 5 quarters back
+_yr_ago = [c for c in qf.columns[1:] if abs((latest_col - c).days - 365) <= 20]
+prev_yr_col = _yr_ago[0] if _yr_ago else None
 
 def fmt_quarter(ts):
     return ts.strftime('%b %Y')
@@ -96,8 +99,12 @@ oi_m_py = oi_py / rev_py if (oi_py and rev_py) else None
 # working for others by coincidence. A report is reliably the first earnings_dates entry
 # shortly after the quarter's period end, so match on that instead.
 consensus_eps = None
+street_eps    = None   # Yahoo "Reported EPS" -- same (street/adjusted) basis as the consensus
 surprise_pct  = None
 latest_edate_idx = None
+if edates is None:
+    edates = pd.DataFrame(columns=['EPS Estimate', 'Reported EPS', 'Surprise(%)'],
+                          index=pd.DatetimeIndex([]))
 reported_dates = edates.dropna(subset=['Reported EPS']).copy()
 if not reported_dates.empty:
     reported_dates.index = reported_dates.index.tz_localize(None)
@@ -108,8 +115,9 @@ if not reported_dates.empty:
     if not window.empty:
         latest_edate_idx = window.index.min()
         row_ed = window.loc[latest_edate_idx]
-        consensus_eps = row_ed['EPS Estimate']
-        surprise_pct  = row_ed['Surprise(%)']
+        consensus_eps = row_ed['EPS Estimate'] if pd.notna(row_ed['EPS Estimate']) else None
+        street_eps    = row_ed['Reported EPS'] if pd.notna(row_ed['Reported EPS']) else None
+        surprise_pct  = row_ed['Surprise(%)'] if pd.notna(row_ed['Surprise(%)']) else None
 
 # Analyst consensus price target
 price     = info.get('currentPrice')
@@ -128,16 +136,17 @@ def rec_str(v):
     if v is None: return 'N/A'
     return rec_label.get(round(v), f'{v:.1f}')
 
-# Revenue consensus (rough: use street estimate from yfinance revenue estimates)
-try:
-    rev_est_df = t.revenue_estimate
-    rev_consensus = rev_est_df.loc['0q', 'avg'] if '0q' in rev_est_df.index else None
-except:
-    rev_consensus = None
+# Revenue consensus: yfinance has no historical revenue consensus for an already-reported
+# quarter. t.revenue_estimate['0q'] is the estimate for the CURRENT (not yet reported)
+# quarter, so comparing it to the latest reported revenue is apples-to-oranges. Leave it
+# unsourced rather than print a meaningless beat/miss.
+rev_consensus = None
+rev_beat = None
 
-# Beat/miss
-rev_beat = (rev - rev_consensus) if (rev and rev_consensus) else None
-eps_beat = (eps - float(consensus_eps)) if (eps and consensus_eps is not None) else None
+# EPS beat/miss: compare street-basis reported EPS to the street-basis consensus. Using the
+# GAAP "Diluted EPS" from quarterly_financials here would mix GAAP and adjusted figures.
+eps_beat = (float(street_eps) - float(consensus_eps)) \
+    if (street_eps is not None and consensus_eps is not None) else None
 
 # ── 4. PRINT REPORT ─────────────────────────────────────────────────────────
 
@@ -161,20 +170,34 @@ def chg(v):
     sign = '+' if v >= 0 else ''
     return f"({sign}{v:.1f}%)"
 
+def fnum(v, spec, prefix='', suffix=''):
+    """Format a possibly-missing number; Yahoo omits fields for many tickers."""
+    if v is None or (isinstance(v, float) and np.isnan(v)): return 'N/A'
+    return f"{prefix}{v:{spec}}{suffix}"
+
 # ── PAGE 1 ──────────────────────────────────────────────────────────────────
 rev_yoy   = pct(rev, rev_py)
 rev_qoq   = pct(rev, rev_pq)
-gm_delta  = (gm - gm_py) * 10000 if (gm and gm_py) else None  # bps
-oim_delta = (oi_m - oi_m_py) * 10000 if (oi_m and oi_m_py) else None
+gm_delta  = (gm - gm_py) * 10000 if (gm is not None and gm_py is not None) else None  # bps
+oim_delta = (oi_m - oi_m_py) * 10000 if (oi_m is not None and oi_m_py is not None) else None
+pt_upside = pct(pt_mean, price)
 
-beat_miss = "BEAT" if (eps_beat and eps_beat > 0) else ("MISS" if eps_beat and eps_beat < 0 else "INLINE")
+if eps_beat is None:
+    beat_miss = "N/A (no matching consensus)"
+elif eps_beat > 0:
+    beat_miss = "BEAT"
+elif eps_beat < 0:
+    beat_miss = "MISS"
+else:
+    beat_miss = "INLINE"
 
 print(f"{COMPANY_NAME.upper()} ({TICKER})  ·  {qname} EARNINGS UPDATE")
 print(f"Analysis Date: {pd.Timestamp.now().date()}  ·  Source: Yahoo Finance (free)")
 print()
 print(f"Analyst Consensus:  {rec_str(rec_mean)}  |  "
-      f"Price Target: ${pt_mean:.0f}  (range ${pt_low:.0f}–${pt_high:.0f})")
-print(f"Current Price: ${price:.2f}  |  Upside to PT: {pct(pt_mean, price):+.1f}%")
+      f"Price Target: {fnum(pt_mean, '.0f', '$')}  "
+      f"(range {fnum(pt_low, '.0f', '$')}–{fnum(pt_high, '.0f', '$')})")
+print(f"Current Price: {fnum(price, '.2f', '$')}  |  Upside to PT: {fnum(pt_upside, '+.1f', suffix='%')}")
 print()
 print("EARNINGS SUMMARY")
 print(SEP)
@@ -182,23 +205,28 @@ print(f"{qname} RESULTS:  {beat_miss}")
 print()
 print(f"{'Metric':<22} {'Reported':>10} {'Consensus':>10} {'Beat/(Miss)':>12}")
 print(f"{'─'*22} {'─'*10} {'─'*10} {'─'*12}")
-rev_c_str  = pp(rev_consensus, 'B') if rev_consensus else 'N/A'
-rev_b_str  = f"${rev_beat/1e9:+.2f}B" if rev_beat else 'N/A'
-print(f"{'Revenue':<22} {pp(rev,'B'):>10} {rev_c_str:>10} {rev_b_str:>12}")
+print(f"{'Revenue':<22} {pp(rev,'B'):>10} {'N/A':>10} {'N/A':>12}  [UNSOURCED: no historical revenue consensus on Yahoo]")
 eps_c_str  = f"${float(consensus_eps):.2f}" if consensus_eps is not None else 'N/A'
 eps_b_str  = f"${eps_beat:+.2f}" if eps_beat is not None else 'N/A'
-print(f"{'EPS (Diluted)':<22} {pp(eps,'$'):>10} {eps_c_str:>10} {eps_b_str:>12}")
+eps_s_str  = f"${float(street_eps):.2f}" if street_eps is not None else 'N/A'
+print(f"{'EPS (street basis)':<22} {eps_s_str:>10} {eps_c_str:>10} {eps_b_str:>12}")
+print(f"{'EPS (GAAP diluted)':<22} {pp(eps,'$'):>10} {'':>10} {'':>12}  (not comparable to consensus)")
 print(f"{'Gross Margin':<22} {pp(gm,'%'):>10}")
 print(f"{'Operating Margin':<22} {pp(oi_m,'%'):>10}")
-if surprise_pct: print(f"\nEPS Surprise: {surprise_pct:+.2f}%")
+if surprise_pct is not None: print(f"\nEPS Surprise: {surprise_pct:+.2f}%")
 print()
 
 # 3 key takeaways
 print("Key Takeaways:")
-gm_dir = "expanded" if (gm_delta and gm_delta > 0) else "compressed"
-print(f"■ Revenue {pp(rev,'B')} grew {rev_yoy:+.1f}% YoY — "
-      f"{'beat' if (rev_beat and rev_beat>0) else 'missed'} consensus")
-print(f"■ Gross margin {pp(gm,'%')} — {gm_dir} {abs(gm_delta):.0f}bps vs. prior year")
+if rev_yoy is not None:
+    print(f"■ Revenue {pp(rev,'B')} {'grew' if rev_yoy >= 0 else 'declined'} {rev_yoy:+.1f}% YoY")
+else:
+    print(f"■ Revenue {pp(rev,'B')} (no prior-year quarter for YoY)")
+if gm_delta is not None:
+    gm_dir = "expanded" if gm_delta > 0 else "compressed"
+    print(f"■ Gross margin {pp(gm,'%')} — {gm_dir} {abs(gm_delta):.0f}bps vs. prior year")
+else:
+    print(f"■ Gross margin {pp(gm,'%')} (no prior-year comparison)")
 print(f"■ Free cash flow {pp(fcf,'B')} in quarter; "
       f"net cash flow from operations {pp(ocf,'B')}")
 
@@ -236,7 +264,7 @@ for metric, vals in rows_data.items():
 
 # ── YoY CHANGES ──────────────────────────────────────────────────────────────
 print()
-print(f"YoY CHANGES  (vs. {fmt_quarter(prev_yr_col)})")
+print(f"YoY CHANGES  (vs. {fmt_quarter(prev_yr_col) if prev_yr_col is not None else 'N/A -- no prior-year quarter'})")
 print(SEP)
 metrics_yoy = [
     ("Revenue",        rev,    rev_py,  'B'),
@@ -265,13 +293,13 @@ if oi_m and oi_m_py:
 print()
 print("VALUATION & ESTIMATES")
 print(SEP)
-print(f"  Current Price   ${price:.2f}")
+print(f"  Current Price   {fnum(price, '.2f', '$')}")
 print(f"  Market Cap      {pp(mktcap,'B')}")
-print(f"  Trailing P/E    {trail_pe:.1f}x" if trail_pe else "  Trailing P/E   N/A")
-print(f"  Forward P/E     {fwd_pe:.1f}x  (based on fwd EPS ${fwd_eps:.2f})" if fwd_pe else "")
-print(f"  52-Week Range   ${info.get('fiftyTwoWeekLow'):.2f} – ${info.get('fiftyTwoWeekHigh'):.2f}")
-print(f"  Analyst PT      ${pt_mean:.0f}  (consensus of {n_analysts} analysts)")
-print(f"  Implied Upside  {pct(pt_mean, price):+.1f}%")
+print(f"  Trailing P/E    {fnum(trail_pe, '.1f', suffix='x')}")
+print(f"  Forward P/E     {fnum(fwd_pe, '.1f', suffix='x')}  (based on fwd EPS {fnum(fwd_eps, '.2f', '$')})")
+print(f"  52-Week Range   {fnum(info.get('fiftyTwoWeekLow'), '.2f', '$')} – {fnum(info.get('fiftyTwoWeekHigh'), '.2f', '$')}")
+print(f"  Analyst PT      {fnum(pt_mean, '.0f', '$')}  (consensus of {n_analysts or 'N/A'} analysts)")
+print(f"  Implied Upside  {fnum(pt_upside, '+.1f', suffix='%')}")
 print(f"  Rating          {rec_str(rec_mean)}")
 
 # ── EPS BEAT HISTORY ─────────────────────────────────────────────────────────
@@ -286,7 +314,10 @@ for idx, row_ed in recent.iterrows():
     est   = row_ed['EPS Estimate']
     rep   = row_ed['Reported EPS']
     surp  = row_ed['Surprise(%)']
-    flag  = "✓ BEAT" if surp > 0 else "✗ MISS"
+    if pd.isna(surp):  flag = ""
+    elif surp > 0:     flag = "✓ BEAT"
+    elif surp < 0:     flag = "✗ MISS"
+    else:              flag = "= INLINE"
     est_s = f"${est:.2f}" if pd.notna(est) else "N/A"
     rep_s = f"${rep:.2f}" if pd.notna(rep) else "N/A"
     surp_s= f"{surp:+.1f}%" if pd.notna(surp) else "N/A"
@@ -302,7 +333,7 @@ bearish_signals = 0
 
 if eps_beat is not None and eps_beat > 0:
     bullish_signals += 1
-    print(f"  ✓ EPS beat consensus by ${eps_beat:+.2f} ({surprise_pct:+.1f}%)")
+    print(f"  ✓ EPS beat consensus by ${eps_beat:+.2f} ({fnum(surprise_pct, '+.1f', suffix='%')})")
 elif eps_beat is not None and eps_beat < 0:
     bearish_signals += 1
     print(f"  ✗ EPS missed consensus by ${eps_beat:.2f}")
@@ -322,25 +353,38 @@ elif rev_yoy is not None:
 else:
     print(f"  ~ Revenue YoY: no prior-year quarter available for comparison (data gap, not counted as a signal)")
 
-if gm_delta and gm_delta > 0:
+if gm_delta is None:
+    print(f"  ~ Gross margin YoY: no prior-year comparison (data gap, not counted as a signal)")
+elif gm_delta > 0:
     bullish_signals += 1
     print(f"  ✓ Gross margin expanded {gm_delta:.0f}bps YoY → pricing power intact")
-elif gm_delta and gm_delta < -50:
+elif gm_delta < -50:
     bearish_signals += 1
     print(f"  ✗ Gross margin compressed {abs(gm_delta):.0f}bps YoY → cost pressure")
 else:
     print(f"  ~ Gross margin {gm_delta:+.0f}bps YoY — largely stable")
 
-if fcf and fcf > 25e9:
+# FCF judged as a margin so the test scales with company size (was a fixed $25B, which
+# only mega-caps could ever pass)
+fcf_margin = fcf / rev if (fcf is not None and rev) else None
+if fcf_margin is not None and fcf_margin >= 0.20:
     bullish_signals += 1
-    print(f"  ✓ Strong free cash flow {pp(fcf,'B')} — supports buybacks/dividends")
+    print(f"  ✓ Strong free cash flow {pp(fcf,'B')} ({fcf_margin*100:.0f}% of revenue) — supports buybacks/dividends")
+elif fcf_margin is not None and fcf_margin < 0:
+    bearish_signals += 1
+    print(f"  ✗ Negative free cash flow {pp(fcf,'B')} in quarter")
 
-if pct(pt_mean, price) and pct(pt_mean, price) > 10:
+if pt_upside is not None and pt_upside > 10:
     bullish_signals += 1
-    print(f"  ✓ Analyst consensus PT ${pt_mean:.0f} implies {pct(pt_mean,price):+.1f}% upside")
+    print(f"  ✓ Analyst consensus PT ${pt_mean:.0f} implies {pt_upside:+.1f}% upside")
+elif pt_upside is not None and pt_upside < 0:
+    bearish_signals += 1
+    print(f"  ✗ Analyst consensus PT ${pt_mean:.0f} is below the current price ({pt_upside:+.1f}%)")
 
 print()
-overall = "BUY / OUTPERFORM" if bullish_signals >= 3 else ("HOLD" if bullish_signals == 2 else "UNDERPERFORM")
+# net count, so bearish signals actually pull the rating down
+net_signals = bullish_signals - bearish_signals
+overall = "BUY / OUTPERFORM" if net_signals >= 2 else ("UNDERPERFORM" if net_signals <= -1 else "HOLD")
 print(f"  Overall signal: {bullish_signals} bullish / {bearish_signals} bearish → {overall}")
 
 print()
@@ -364,7 +408,7 @@ om_vals   = [get(qf,'Operating Income',c)/get(qf,'Total Revenue',c)*100
 fcf_vals  = [(b(get(cf, 'Free Cash Flow', c)) if get(cf, 'Free Cash Flow', c) is not None else 0)
              for c in qf.columns[:8]][::-1]
 
-colors = ['#1f77b4'] * 8
+colors = ['#1f77b4'] * len(quarters)
 colors[-1] = '#d62728'  # highlight latest quarter
 
 # Chart 1: Quarterly Revenue
@@ -383,20 +427,25 @@ ax2 = fig.add_subplot(gs[0, 1])
 ax2.bar(range(len(quarters)), eps_vals, color=colors)
 ax2.set_xticks(range(len(quarters)))
 ax2.set_xticklabels(quarters, rotation=45, ha='right', fontsize=7)
-ax2.set_title('Diluted EPS ($)', fontweight='bold', fontsize=9)
+ax2.set_title('EPS: GAAP bars vs. street consensus', fontweight='bold', fontsize=9)
 ax2.set_ylabel('EPS ($)')
 
-# EPS beat/miss overlay
-ed_clean = edates.dropna(subset=['Reported EPS', 'EPS Estimate']).head(8)
-est_map = {}
-for idx, row_ed in ed_clean.iterrows():
-    label = idx.strftime('%b %Y')
-    est_map[label] = float(row_ed['EPS Estimate'])
-est_line = [est_map.get(q) for q in quarters]
-valid_x = [i for i, v in enumerate(est_line) if v is not None]
-valid_y = [v for v in est_line if v is not None]
-if valid_x:
-    ax2.plot(valid_x, valid_y, 'k--', linewidth=1, label='Consensus', zorder=5)
+# EPS consensus overlay. Estimates are keyed by REPORT date, bars by QUARTER-END date, so
+# map each quarter to its report with the same window used for the headline match above
+# (keying both by month label never lined up: a Mar quarter is reported in Apr/May).
+est_line, street_line = [], []
+for c in list(qf.columns[:8])[::-1]:
+    w = reported_dates[(reported_dates.index >= c - pd.Timedelta(days=10)) &
+                       (reported_dates.index <= c + pd.Timedelta(days=45))] \
+        if not reported_dates.empty else reported_dates
+    r0 = w.loc[w.index.min()] if not w.empty else None
+    est_line.append(float(r0['EPS Estimate']) if r0 is not None and pd.notna(r0['EPS Estimate']) else None)
+    street_line.append(float(r0['Reported EPS']) if r0 is not None and pd.notna(r0['Reported EPS']) else None)
+for series, style, lbl in [(est_line, 'k--', 'Consensus (street)'),
+                           (street_line, 'go', 'Reported (street)')]:
+    xs = [i for i, v in enumerate(series) if v is not None]
+    if xs:
+        ax2.plot(xs, [series[i] for i in xs], style, linewidth=1, markersize=4, label=lbl, zorder=5)
 ax2.legend(fontsize=7)
 
 # Chart 3: Margin trend
@@ -424,7 +473,7 @@ ax5 = fig.add_subplot(gs[1, 1])
 ed_plot = edates.dropna(subset=['Reported EPS', 'EPS Estimate', 'Surprise(%)']).head(6)
 surps = ed_plot['Surprise(%)'].values.astype(float)[::-1]
 qlabels5 = [i.strftime('%b %y') for i in ed_plot.index[::-1]]
-bar_colors = ['#2ca02c' if s > 0 else '#d62728' for s in surps]
+bar_colors = ['#2ca02c' if s > 0 else ('#d62728' if s < 0 else '#7f7f7f') for s in surps]
 ax5.bar(range(len(surps)), surps, color=bar_colors)
 ax5.axhline(0, color='black', linewidth=0.8)
 ax5.set_xticks(range(len(surps)))
@@ -443,13 +492,13 @@ ax6.set_title('Analyst Consensus', fontweight='bold', fontsize=9)
 
 # Simple valuation summary as text
 lines = [
-    f"Current Price:  ${price:.2f}",
+    f"Current Price:  {fnum(price, '.2f', '$')}",
     f"",
-    f"PT Low:         ${pt_low:.0f}",
-    f"PT Mean:        ${pt_mean:.0f}",
-    f"PT High:        ${pt_high:.0f}",
+    f"PT Low:         {fnum(pt_low, '.0f', '$')}",
+    f"PT Mean:        {fnum(pt_mean, '.0f', '$')}",
+    f"PT High:        {fnum(pt_high, '.0f', '$')}",
     f"",
-    f"Upside to PT:   {pct(pt_mean, price):+.1f}%",
+    f"Upside to PT:   {fnum(pt_upside, '+.1f', suffix='%')}",
     f"",
     f"Trailing P/E:   {trail_pe:.1f}x" if trail_pe else "",
     f"Forward P/E:    {fwd_pe:.1f}x" if fwd_pe else "",
