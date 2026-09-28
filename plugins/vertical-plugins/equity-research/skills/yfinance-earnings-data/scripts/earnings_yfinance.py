@@ -37,17 +37,20 @@ cf   = t.quarterly_cashflow
 info = t.info
 edates = t.earnings_dates
 
-if qf.empty or len(qf.columns) < 5:
-    print(f"[UNSOURCED] '{TICKER}' has no usable quarterly earnings history on "
-          f"Yahoo Finance (found {len(qf.columns)} quarter(s); need >= 5 for a "
-          f"YoY comparison). This is expected for ETFs, indices, delisted, or "
-          f"invalid tickers, and can also happen for a company that IPO'd "
-          f"recently. Not a network error -- the data genuinely isn't there.")
+if qf is None or qf.empty:
+    print(f"[UNSOURCED] '{TICKER}' has no quarterly financials on Yahoo Finance. "
+          f"This is expected for ETFs, indices, delisted, or invalid tickers. "
+          f"Not a network error -- the data genuinely isn't there.")
     sys.exit(1)
+# Yahoo often returns only 4-5 quarters. Anything that needs a prior-year or prior
+# quarter shows N/A when it's missing instead of rejecting the whole ticker.
+qf = qf.sort_index(axis=1, ascending=False)
+if cf is None:
+    cf = pd.DataFrame()
 
 # ── 2. IDENTIFY LATEST QUARTER ─────────────────────────────────────────────
 latest_col  = qf.columns[0]   # most recent quarter
-prev_q_col  = qf.columns[1]   # previous quarter
+prev_q_col  = qf.columns[1] if len(qf.columns) > 1 else None   # previous quarter
 # same quarter last year: match by date, not position -- Yahoo sometimes drops a quarter,
 # in which case columns[4] would silently be 5 quarters back
 _yr_ago = [c for c in qf.columns[1:] if abs((latest_col - c).days - 365) <= 20]
@@ -56,8 +59,16 @@ prev_yr_col = _yr_ago[0] if _yr_ago else None
 def fmt_quarter(ts):
     return ts.strftime('%b %Y')
 
-def b(x): return x / 1e9   # to billions
-def m(x): return x / 1e6   # to millions
+def b(x): return x / 1e9 if x is not None else None   # to billions
+def m(x): return x / 1e6 if x is not None else None   # to millions
+
+def ratio(num, den, scale=1):
+    """num / den * scale, or None if either is missing or den is 0."""
+    return num / den * scale if (num is not None and den) else None
+
+def nan(v):
+    """None -> NaN, so matplotlib leaves a gap instead of raising."""
+    return np.nan if v is None else v
 
 qname = fmt_quarter(latest_col)
 
@@ -85,10 +96,10 @@ fcf     = get(cf, 'Free Cash Flow', latest_col)
 capex   = get(cf, 'Capital Expenditure', latest_col)
 ocf     = get(cf, 'Operating Cash Flow', latest_col)
 
-gm      = gp / rev if (gp and rev) else None
-oi_m    = oi / rev if (oi and rev) else None
-gm_py   = gp_py / rev_py if (gp_py and rev_py) else None
-oi_m_py = oi_py / rev_py if (oi_py and rev_py) else None
+gm      = ratio(gp, rev)
+oi_m    = ratio(oi, rev)
+gm_py   = ratio(gp_py, rev_py)
+oi_m_py = ratio(oi_py, rev_py)
 
 # Consensus EPS from earnings_dates.
 # Matched by REPORT DATE proximity to the quarter-end, not by comparing EPS values:
@@ -241,10 +252,8 @@ labels = [fmt_quarter(c) for c in cols]
 
 rows_data = {
     'Revenue ($B)'    : [b(get(qf,'Total Revenue', c)) for c in cols],
-    'Gross Margin'    : [get(qf,'Gross Profit',c)/get(qf,'Total Revenue',c)*100
-                         if get(qf,'Total Revenue',c) else None for c in cols],
-    'Operating Margin': [get(qf,'Operating Income',c)/get(qf,'Total Revenue',c)*100
-                         if get(qf,'Total Revenue',c) else None for c in cols],
+    'Gross Margin'    : [ratio(get(qf,'Gross Profit',c), get(qf,'Total Revenue',c), 100) for c in cols],
+    'Operating Margin': [ratio(get(qf,'Operating Income',c), get(qf,'Total Revenue',c), 100) for c in cols],
     'Net Income ($B)' : [b(get(qf,'Net Income', c)) for c in cols],
     'Diluted EPS ($)' : [get(qf,'Diluted EPS', c) for c in cols],
     'Free CF ($B)'    : [b(get(cf,'Free Cash Flow', c)) for c in cols],
@@ -401,14 +410,12 @@ fig.suptitle(f"{COMPANY_NAME} ({TICKER}) — Earnings Dashboard\n{qname} | Yahoo
 gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
 
 quarters  = [fmt_quarter(c) for c in qf.columns[:8]][::-1]
-revenues  = [b(get(qf, 'Total Revenue', c)) for c in qf.columns[:8]][::-1]
-eps_vals  = [get(qf, 'Diluted EPS', c) for c in qf.columns[:8]][::-1]
-gm_vals   = [get(qf,'Gross Profit',c)/get(qf,'Total Revenue',c)*100
-             if get(qf,'Total Revenue',c) else None for c in qf.columns[:8]][::-1]
-om_vals   = [get(qf,'Operating Income',c)/get(qf,'Total Revenue',c)*100
-             if get(qf,'Total Revenue',c) else None for c in qf.columns[:8]][::-1]
-fcf_vals  = [(b(get(cf, 'Free Cash Flow', c)) if get(cf, 'Free Cash Flow', c) is not None else 0)
-             for c in qf.columns[:8]][::-1]
+# missing values become NaN so the bar/line is left out instead of crashing matplotlib
+revenues  = [nan(b(get(qf, 'Total Revenue', c))) for c in qf.columns[:8]][::-1]
+eps_vals  = [nan(get(qf, 'Diluted EPS', c)) for c in qf.columns[:8]][::-1]
+gm_vals   = [nan(ratio(get(qf,'Gross Profit',c), get(qf,'Total Revenue',c), 100)) for c in qf.columns[:8]][::-1]
+om_vals   = [nan(ratio(get(qf,'Operating Income',c), get(qf,'Total Revenue',c), 100)) for c in qf.columns[:8]][::-1]
+fcf_vals  = [nan(b(get(cf, 'Free Cash Flow', c))) for c in qf.columns[:8]][::-1]
 
 colors = ['#1f77b4'] * len(quarters)
 colors[-1] = '#d62728'  # highlight latest quarter
@@ -421,7 +428,7 @@ ax1.set_xticklabels(quarters, rotation=45, ha='right', fontsize=7)
 ax1.set_title('Quarterly Revenue ($B)', fontweight='bold', fontsize=9)
 ax1.set_ylabel('$B')
 for bar, val in zip(bars[-2:], revenues[-2:]):
-    if val: ax1.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+    if pd.notna(val): ax1.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
                      f'${val:.0f}B', ha='center', va='bottom', fontsize=7)
 
 # Chart 2: Quarterly EPS
