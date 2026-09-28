@@ -33,6 +33,8 @@ Historical backtest of the **earnings reaction**. For every past reported quarte
 - `1wk` / `1mo` / `3mo` = 5 / 21 / 63 trading days after the pre-print close (these include the day-1 reaction)
 - each also reported **in excess of SPY** (`--benchmark`) over the same window
 
+`--out records.jsonl` also writes one JSON line per quarter -- `features` (EPS estimate/reported/surprise, revenue YoY, gross margin, plus null transcript-sentiment placeholders) and `labels` (raw and excess-vs-SPY returns as fractions; null until the horizon has elapsed), with `available_at` / `t0` recording when the inputs were public and where returns start. Revenue YoY and gross margin are only filled for the ~5 most recent quarters Yahoo's `quarterly_financials` covers.
+
 `--anchor post-call` switches to the **post-call return**: t0 is the first regular-session open/close at least `--call-lag` hours (default 3) after the print, i.e. once the call transcript exists (after-market print: next day's open). Use this whenever the question is "does what was said on the call predict the move from here" -- the default pre-print anchor includes the price move that happened before the transcript was available.
 
 Signal is BEAT / INLINE / MISS from Yahoo's Surprise% (`--inline-band`, default 0). For each horizon it reports the hit rate **next to the base rate** (share of all quarters that moved that way) and the difference ("edge"). Quarters whose Yahoo timestamp has no time of day can't be placed before/after the open, so they are excluded unless `--assume-unknown bmo|amc` is given.

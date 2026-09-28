@@ -42,7 +42,7 @@ nothing if the stock rose after 75% of all prints anyway.
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import warnings, argparse, sys
+import warnings, argparse, sys, json
 warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser()
@@ -61,6 +61,8 @@ parser.add_argument("--inline-band", type=float, default=0.0,
                     help="|Surprise%%| <= this is INLINE (default 0 = exact match only)")
 parser.add_argument("--assume-unknown", choices=["skip", "bmo", "amc"], default="skip",
                     help="How to treat earnings timestamps with no time of day (00:00)")
+parser.add_argument("--out", default="",
+                    help="Also write one JSON record per quarter (features + labels) to this .jsonl path")
 args, _ = parser.parse_known_args()
 
 TICKERS = [tk.strip().upper() for tk in args.tickers.split(",") if tk.strip()]
@@ -121,8 +123,47 @@ def horizon_index(i0, ndays):
     return 2 * end_day + 1
 
 
+def _fin(qf, row, col):
+    try:
+        v = qf.loc[row, col]
+        return float(v) if pd.notna(v) else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def financial_features(qf, edate):
+    """Revenue YoY and gross margin for the quarter this print reports.
+
+    The reported quarter is the latest quarter-end within 60 days before the print.
+    Yahoo's quarterly_financials only covers ~5 recent quarters, so older prints get
+    None. Values are as currently reported (may include later restatements).
+    """
+    out = {"fiscal_quarter_end": None, "revenue_yoy": None, "gross_margin": None}
+    if qf is None or qf.empty:
+        return out
+    cands = [c for c in qf.columns if pd.Timedelta(0) <= edate - c <= pd.Timedelta(days=60)]
+    if not cands:
+        return out
+    q = max(cands)
+    out["fiscal_quarter_end"] = q.date().isoformat()
+    rev = _fin(qf, "Total Revenue", q)
+    gp = _fin(qf, "Gross Profit", q)
+    yr_ago = [c for c in qf.columns if abs((q - c).days - 365) <= 20]
+    rev_py = _fin(qf, "Total Revenue", yr_ago[0]) if yr_ago else None
+    if rev and gp is not None:
+        out["gross_margin"] = gp / rev
+    if rev is not None and rev_py:
+        out["revenue_yoy"] = rev / rev_py - 1
+    return out
+
+
 def get_returns(ticker, bench_tl):
     t = yf.Ticker(ticker)
+    try:
+        qf = t.quarterly_financials
+        qf.columns = pd.to_datetime(qf.columns)
+    except Exception:
+        qf = None
     ed = t.get_earnings_dates(limit=args.limit)
     if ed is None or ed.empty:
         raise ValueError("no earnings dates returned")
@@ -154,6 +195,10 @@ def get_returns(ticker, bench_tl):
             "surprise_pct": r["Surprise(%)"],
             "signal": classify(r["Surprise(%)"]),
             "t0": None, "p0": np.nan,
+            # when the model's inputs are public: the print itself, or the end of the call
+            "available_at": None if ann is None else
+                (ann + pd.Timedelta(hours=args.call_lag) if args.anchor == "post-call" else ann),
+            **financial_features(qf, edate),
         }
         for label, _ in HORIZONS:
             row[f"ret_{label}"] = np.nan
@@ -196,6 +241,53 @@ if not all_rows:
     sys.exit(1)
 big = pd.concat(all_rows, ignore_index=True)
 usable = big[big["timing"] != "UNKNOWN"] if args.assume_unknown == "skip" else big
+
+
+def _num(v, scale=1.0):
+    """NaN/None -> None (JSON null); otherwise a plain float."""
+    return None if v is None or pd.isna(v) else float(v) * scale
+
+
+def write_records(df, path):
+    """One JSON line per quarter: features (model inputs) + labels (realized returns).
+
+    Returns are fractions (0.023 = +2.3%). A label is null when its horizon hasn't
+    happened yet or the print can't be placed in time. Transcript features are
+    null placeholders for the extraction step to fill in.
+    """
+    with open(path, "w") as fh:
+        for r in df.itertuples(index=False):
+            rec = {
+                "ticker": r.ticker,
+                "earnings_ts": r.earnings_ts.isoformat(),
+                "timing": r.timing,
+                "fiscal_quarter_end": r.fiscal_quarter_end,
+                "anchor": args.anchor,
+                "available_at": r.available_at.isoformat() if r.available_at is not None else None,
+                "t0": r.t0,
+                "p0": _num(r.p0),
+                "features": {
+                    "eps_estimate": _num(r.eps_est),
+                    "eps_reported": _num(r.eps_rep),
+                    "eps_surprise": _num(r.surprise_pct, 0.01),
+                    "eps_signal": r.signal,
+                    "revenue_yoy": _num(r.revenue_yoy),
+                    "gross_margin": _num(r.gross_margin),
+                    "management_sentiment": None,
+                    "guidance_sentiment": None,
+                    "risk_sentiment": None,
+                },
+                "labels": {
+                    **{f"return_{lbl}": _num(getattr(r, f"ret_{lbl}"), 0.01) for lbl, _ in HORIZONS},
+                    **{f"excess_return_{lbl}": _num(getattr(r, f"xret_{lbl}"), 0.01) for lbl, _ in HORIZONS},
+                },
+            }
+            fh.write(json.dumps(rec) + "\n")
+    print(f"[OUT] wrote {len(df)} record(s) -> {path}")
+
+
+if args.out:
+    write_records(big, args.out)
 
 pd.set_option("display.width", 200)
 pd.set_option("display.max_rows", 500)
